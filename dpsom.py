@@ -26,6 +26,7 @@ from utils import cluster_purity
 # CONFIG SYSTEM (replaces sacred)
 # =========================
 
+
 class DPSOM_Config:
     def __init__(self):
         self.num_epochs = 300
@@ -35,7 +36,7 @@ class DPSOM_Config:
         self.learning_rate = 0.001
         self.learning_rate_pretrain = 0.001
         self.alpha = 10.0
-        self.beta = 0.4
+        self.beta = 0.25
         self.gamma = 20
         self.theta = 1
         self.epochs_pretrain = 15
@@ -45,7 +46,7 @@ class DPSOM_Config:
         self.ex_name = f"{self.name}_{self.latent_dim}_{self.som_dim[0]}-{self.som_dim[1]}_{str(date.today())}_{uuid.uuid4().hex[:5]}"
         self.logdir = f"logs/{self.ex_name}"
         self.modelpath = f"models/{self.ex_name}/{self.ex_name}.ckpt"
-        self.data_set = "fMNIST"
+        self.data_set = "MNIST"
         self.dropout = 0.4
         self.prior_var = 1
         self.prior = 0.5
@@ -184,7 +185,8 @@ def train_model(
                     g["lr"] = float(learning_rate_pretrain)
 
                 train_step_vae.zero_grad()
-                loss_rec = model.loss_reconstruction_vae(x_batch)
+                z = model(x_batch)
+                loss_rec = model.loss_reconstruction_ze(x_batch)
                 loss_rec.backward()
                 train_step_vae.step()
 
@@ -197,7 +199,8 @@ def train_model(
                     x_val = _np_to_torch(batch_val, device)
                     with torch.no_grad():
                         # Compute ELBO (reconstruction + KL)
-                        val_elbo = model.loss_reconstruction_vae(x_val).item()
+                        model(x_val)
+                        val_elbo = model.loss_reconstruction_ze(x_val).item()
                         val_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
                         val_log_lik = val_elbo - model.prior * val_kl
 
@@ -229,7 +232,8 @@ def train_model(
                         g["lr"] = float(lr_phase)
 
                     train_step_som.zero_grad()
-                    loss_init, loss_som_s, loss_commit_s = model.loss_a(x_batch)
+                    z = model(x_batch)
+                    loss_init, loss_som_s, loss_commit_s = model.loss_a(z)
                     loss_init.backward()
                     train_step_som.step()
 
@@ -237,14 +241,15 @@ def train_model(
                         batch_val, _, _ = next(val_gen)
                         x_val = _np_to_torch(batch_val, device)
                         with torch.no_grad():
-                            loss_elbo = model.loss_reconstruction_vae(x_batch)
-                            loss_init, loss_som_s, loss_commit_s = model.loss_a(x_batch)
+                            loss_elbo = model.loss_reconstruction_ze(x_batch)
+                            loss_init, loss_som_s, loss_commit_s = model.loss_a(z)
                             train_elbo = loss_elbo.item()
                             train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
                             train_log_lik = train_elbo - model.prior * train_kl
-                            val_loss_elbo = model.loss_reconstruction_vae(x_val)
+                            z = model(x_val)
+                            val_loss_elbo = model.loss_reconstruction_ze(x_val)
                             test_elbo = val_loss_elbo.item()
-                            val_loss_init, val_loss_som_s, val_loss_commit_s = model.loss_a(x_val)
+                            val_loss_init, val_loss_som_s, val_loss_commit_s = model.loss_a(z)
                             test_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
                             test_log_lik = test_elbo - model.prior * test_kl
                         test_writer.add_scalar("loss/loss_elbo", test_elbo, step)
@@ -312,7 +317,8 @@ def train_model(
                 g["lr"] = new_lr
 
             train_step_psom.zero_grad()
-            loss_total, loss_elbo, loss_commit, loss_som = model.loss(x_batch)
+            z = model(x_batch)
+            loss_total, loss_elbo, loss_commit, loss_som = model.loss(x_batch, z)
             loss_total.backward()
             train_step_psom.step()
 
@@ -321,8 +327,7 @@ def train_model(
             train_elbo = loss_elbo.item()
             train_commit = loss_commit.item()
             train_som = loss_som.item()
-            train_commit_s = model.loss_commit_s(x_batch).item()
-            train_som_s = model.loss_som_s(x_batch).item()
+            _, train_som_s, train_commit_s = model.loss_a(z)
 
             train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
             train_log_lik = train_elbo - model.prior * train_kl
@@ -338,13 +343,13 @@ def train_model(
                 model.set_p(p_val)
 
                 # Compute all component losses for validation
-                val_loss, val_elbo, val_commit, val_som = model.loss(x_val)
+                z = model(x_val)
+                val_loss, val_elbo, val_commit, val_som = model.loss(x_val, z)
                 test_loss = val_loss.item()
                 test_elbo = val_elbo.item()
                 test_commit = val_commit.item()
                 test_som = val_som.item()
-                test_commit_s = model.loss_commit_s(x_val).item()
-                test_som_s = model.loss_som_s(x_val).item()
+                _, test_som_s, test_commit_s = model.loss_a(z)
 
                 # Get KL and log-likelihood separately
                 test_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
@@ -363,8 +368,8 @@ def train_model(
                 test_writer.add_scalar("loss/loss_elbo", elbo_loss, step)
                 test_writer.add_scalar("loss/loss_commit", cah_loss, step)
                 test_writer.add_scalar("loss/loss_som", ssom_loss, step)
-                test_writer.add_scalar("loss_commit_s/loss_commit_s", test_commit_s, step)
-                test_writer.add_scalar("loss_som_s/loss_som_s", test_som_s, step)
+                test_writer.add_scalar("loss_commit_s/loss_commit_s", test_commit_s.item(), step)
+                test_writer.add_scalar("loss_som_s/loss_som_s", test_som_s.item(), step)
                 test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", test_kl, step)
                 test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss", test_log_lik, step)
 
@@ -373,8 +378,8 @@ def train_model(
                 train_writer.add_scalar("loss/loss_elbo", train_elbo, step)
                 train_writer.add_scalar("loss/loss_commit", train_loss_commit, step)
                 train_writer.add_scalar("loss/loss_som", train_loss_som, step)
-                train_writer.add_scalar("loss_commit_s/loss_commit_s", train_commit_s, step)
-                train_writer.add_scalar("loss_som_s/loss_som_s", train_som_s, step)
+                train_writer.add_scalar("loss_commit_s/loss_commit_s", train_commit_s.item(), step)
+                train_writer.add_scalar("loss_som_s/loss_som_s", train_som_s.item(), step)
                 train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", train_kl, step)
                 train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss", train_log_lik, step)
 
@@ -449,8 +454,8 @@ def evaluate_model(
             batch_data, batch_labels, _ii = next(val_gen)
             labels_val_all.extend(batch_labels.tolist() if hasattr(batch_labels, "tolist") else list(batch_labels))
             x_val = _np_to_torch(batch_data, device)
-            model.compute_z_e(x_val)
-            k_pred = model.k(x_val).cpu().numpy().tolist()
+            z = model(x_val)
+            k_pred = model.k(z).cpu().numpy().tolist()
             test_k_all.extend(k_pred)
 
     test_nmi = metrics.normalized_mutual_info_score(np.array(labels_val_all), np.array(test_k_all), average_method="geometric")

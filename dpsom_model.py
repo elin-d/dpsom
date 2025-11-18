@@ -48,8 +48,8 @@ class DPSOM(nn.Module):
         self.toroidal = toroidal
 
         # Prior parameters for KL (zero-mean, diagonal with prior_var)
-        self._prior_loc = torch.zeros(self.latent_dim)
-        self._prior_scale = torch.ones(self.latent_dim) * float(self.prior_var)
+        self.register_buffer("_prior_loc", torch.zeros(self.latent_dim))
+        self.register_buffer("_prior_scale", torch.ones(self.latent_dim) * float(self.prior_var))
 
         # SOM embeddings: shape [H, W, latent_dim] as in TF
         H, W = self.som_dim[0], self.som_dim[1]
@@ -117,8 +117,6 @@ class DPSOM(nn.Module):
         self._train_epoch = 0
 
         self._p_tensor = None  # target distribution p (set externally each batch)
-        self.z_e = None
-        self.z_e_ng = None
         self.mu = None
         self.logvar = None
 
@@ -136,7 +134,7 @@ class DPSOM(nn.Module):
         Returns mu, logvar
         """
         if x.dim() == 4 and x.shape[1] == 1 and x.shape[2] == 28:
-            x = x.permute(0, 2, 3, 1)  # [B,28,28,1] for uniform handling
+            x = x.permute(0, 2, 3, 1).contiguous()  # [B,28,28,1] for uniform handling
         if not self.convolution:
             flat = x.view(x.size(0), -1)
             h = F.leaky_relu(self.enc_fc1(flat), 0.2)
@@ -207,21 +205,20 @@ class DPSOM(nn.Module):
 
     # ====== Latent sampling and distances ======
 
-    def compute_z_e(self, x):
+    def forward(self, x):
         mu, logvar = self._encode(x)
         eps = torch.randn_like(mu)
         z = mu + eps * torch.exp(0.5 * logvar)
-        self.z_e = z
-        self.z_e_ng = z.detach()
         self.mu = mu
         self.logvar = logvar
+        self.logits = self._decode(z)
+        return z
 
-    def z_dist_flat(self, x, stop_grad=False):
+    def z_dist_flat(self, z):
         """
         Compute squared distances between embeddings and latent samples.
         Returns [B, H*W].
         """
-        z = self.z_e_ng if stop_grad else self.z_e
         H, W = self.som_dim[0], self.som_dim[1]
         E = self._embeddings  # [H, W, D]
         z_exp = z[:, None, None, :]  # [B,1,1,D]
@@ -230,17 +227,15 @@ class DPSOM(nn.Module):
         z_dist_flat = z_dist.view(z_dist.shape[0], H * W)  # [B, H*W]
         return z_dist_flat
 
-    def z_dist_flat_ng(self, x):
-        return self.z_dist_flat(x, stop_grad=True)
 
-    def k(self, x):
+    def k(self, z):
         """
         Pick index of closest centroid for every embedding. Returns LongTensor [B]
         """
-        dist_flat = self.z_dist_flat(x)  # [B, H*W]
+        dist_flat = self.z_dist_flat(z)  # [B, H*W]
         return torch.argmin(dist_flat, dim=-1)
 
-    def z_q(self, x):
+    def z_q(self, z):
         """
         Aggregate closest centroid for every embedding. Returns [B, D]
 
@@ -252,7 +247,7 @@ class DPSOM(nn.Module):
             Linear indexing: flat_idx = row * W + col
         """
         H, W = self.som_dim[0], self.som_dim[1]
-        k = self.k(x)  # [B]
+        k = self.k(z)  # [B]
         k1 = k // W
         k2 = k % W
         gathered = self._embeddings[k1, k2, :]  # [B, D]
@@ -291,13 +286,13 @@ class DPSOM(nn.Module):
 
         return k_up, k_down, k_right, k_left
 
-    def z_q_neighbors(self, x):
+    def z_q_neighbors(self, z):
         """
         Aggregate neighbor centroids in the SOM grid for each z_q.
         Returns [B, 5, D] = [center, up, down, right, left]
         """
         H, W = self.som_dim[0], self.som_dim[1]
-        k = self.k(x)  # [B]
+        k = self.k(z)  # [B]
 
         k_up, k_down, k_right, k_left = self.som_neighbors(k)
 
@@ -336,20 +331,15 @@ class DPSOM(nn.Module):
         )
         return kl.mean()
 
-    def loss_reconstruction_vae(self, x):
-        self.compute_z_e(x)
-        return self.loss_reconstruction_ze(x)
-
     def loss_reconstruction_ze(self, x):
         """
         Compute ELBO: negative log-likelihood + prior * KL
         Bernoulli likelihood with logits; inputs expected in [0,1].
         """
 
-        z = self.z_e
         mu = self.mu
         logvar = self.logvar
-        logits = self._decode(z)  # [B,784]
+        logits = self.logits # [B,784]
         x_flat = x.view(x.shape[0], -1).clamp(0.0, 1.0)
 
         loss_pix = F.binary_cross_entropy_with_logits(logits, x_flat, reduction="none")  # [B, 784]
@@ -359,32 +349,33 @@ class DPSOM(nn.Module):
         loss_rec = log_lik_loss + self.prior * kl_loss
         return loss_rec
 
-    def q(self, x, detach_z=False):
+    def q(self, z):
         """
         Soft assignments between embeddings and centroids (Student's t-kernel).
         Returns [B, H*W].
         """
-        if detach_z:
-            dist_flat = self.z_dist_flat_ng(x)
-        else:
-            dist_flat = self.z_dist_flat(x)
+        dist_flat = self.z_dist_flat(z)
         eps = torch.finfo(dist_flat.dtype).eps
         q = eps + 1.0 / torch.pow(1.0 + dist_flat / self.alpha, (self.alpha + 1.0) / 2.0)
         q = q / q.sum(dim=1, keepdim=True)
         return q
 
-    def q_p(self, x, detach_z=False):
-        self.compute_z_e(x)
+    def q_p(self, x):
         """
         Soft assignments between embeddings and centroids (Student's t-kernel).
         Returns [B, H*W].
         """
-        if detach_z:
-            dist_flat = self.z_dist_flat_ng(x)
-        else:
-            dist_flat = self.z_dist_flat(x)
-        eps = torch.finfo(dist_flat.dtype).eps
-        q = eps + 1.0 / torch.pow(1.0 + dist_flat / self.alpha, (self.alpha + 1.0) / 2.0)
+        mu, logvar = self._encode(x)
+        eps = torch.randn_like(mu)
+        z = mu + eps * torch.exp(0.5 * logvar)
+        H, W = self.som_dim[0], self.som_dim[1]
+        E = self._embeddings  # [H, W, D]
+        z_exp = z[:, None, None, :]  # [B,1,1,D]
+        diff = z_exp - E[None, :, :, :]  # [B,H,W,D]
+        z_dist = (diff * diff).sum(dim=-1)  # [B,H,W]
+        z_dist_flat = z_dist.view(z_dist.shape[0], H * W)  # [B, H*W]
+        eps = torch.finfo(z_dist_flat.dtype).eps
+        q = eps + 1.0 / torch.pow(1.0 + z_dist_flat / self.alpha, (self.alpha + 1.0) / 2.0)
         q = q / q.sum(dim=1, keepdim=True)
         return q
 
@@ -402,11 +393,11 @@ class DPSOM(nn.Module):
         """
         self._p_tensor = p_tensor
 
-    def loss_commit(self, x, eps: float = 1e-10):
+    def loss_commit(self, z, eps: float = 1e-10):
         """
         Commitment loss: KL(P || Q) with per-sample sum, then batch mean.
         """
-        q = self.q(x)                          # [B, K], soft assignments
+        q = self.q(z)                          # [B, K], soft assignments
         p = self.p                              # [B, K], set via set_p() beforehand
         p = p.to(q.dtype).to(q.device)
         # Clamp BEFORE logs to avoid -inf and match TF clip_by_value placement
@@ -416,6 +407,7 @@ class DPSOM(nn.Module):
         per_sample_kl = (p_safe * (p_safe.log() - q_safe.log())).sum(dim=1)
         return per_sample_kl.mean()
 
+    @torch.no_grad()
     def target_distribution(self, q_np):
         """
         Compute target distribution from soft assignments (on numpy, to match original usage).
@@ -424,7 +416,7 @@ class DPSOM(nn.Module):
         p = p / p.sum(axis=1, keepdims=True)
         return p
 
-    def loss_som(self, x):
+    def loss_som(self, z):
         """
         SOM neighbor regularization using detached q for neighbors.
         """
@@ -432,8 +424,8 @@ class DPSOM(nn.Module):
 
         k = torch.arange(H * W, device=self._embeddings.device, dtype=torch.long)  # [H*W]
         k_up, k_down, k_right, k_left = self.som_neighbors(k)
-
-        q_t = self.q(x, detach_z=True).transpose(0, 1)  # [H*W, B]
+        z_ng = z.detach()
+        q_t = self.q(z_ng).transpose(0, 1)  # [H*W, B]
         q_up = q_t[k_up].transpose(0, 1)
         q_down = q_t[k_down].transpose(0, 1)
         q_right = q_t[k_right].transpose(0, 1)
@@ -443,57 +435,41 @@ class DPSOM(nn.Module):
         eps = torch.finfo(q_neighbours.dtype).eps
         q_neighbours_log_sum = torch.sum(torch.log(q_neighbours + eps), dim=-1)  # [B, H*W]
 
-        new_q = self.q(x)  # [B, H*W]
+        new_q = self.q(z)  # [B, H*W]
         q_n = q_neighbours_log_sum * new_q.detach()
         q_n = torch.sum(q_n, dim=-1)  # [B]
         qq = -torch.mean(q_n)
         return qq
 
-    def loss(self, x):
+    def loss(self, x, z):
         """
         Aggregate total loss.
         """
-        self.compute_z_e(x)
         a = self.theta * self.loss_reconstruction_ze(x)
-        b = self.gamma * self.loss_commit(x)
-        c = self.beta * self.loss_som(x)
+        b = self.gamma * self.loss_commit(z)
+        c = self.beta * self.loss_som(z)
         return a + b + c, a, b, c
 
-    def loss_commit_s(self, x):
+    def loss_commit_s(self, z_ng):
         """
         Commitment loss for standard SOM initialization: ||z - z_q||^2
         """
-        z = self.z_e_ng
-        zq = self.z_q(x)
-        return torch.mean((z - zq) ** 2)
+        zq = self.z_q(z_ng)
+        return torch.mean((z_ng - zq) ** 2)
 
-    def loss_som_s(self, x):
+    def loss_som_s(self, z_ng):
         """
         SOM neighbor loss for standard SOM initialization: ||z - neighbors||^2
         """
-        z = self.z_e_ng.unsqueeze(1)  # [B,1,D]
-        z_ngb = self.z_q_neighbors(x)  # [B,5,D]
+        z = z_ng.unsqueeze(1)  # [B,1,D]
+        z_ngb = self.z_q_neighbors(z_ng)  # [B,5,D]
         return torch.mean((z - z_ngb) ** 2)
 
-    def loss_a(self, x):
+    def loss_a(self, z):
         """
         Clustering loss of standard SOM used for initialization.
         """
-        self.compute_z_e(x)
-        a = self.loss_som_s(x)
-        b = self.loss_commit_s(x)
+        z_ng = z.detach()
+        a = self.loss_som_s(z_ng)
+        b = self.loss_commit_s(z_ng)
         return a + b, a, b
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        device = kwargs.get("device", args[0] if len(args) > 0 else None)
-        if device is not None:
-            self._prior_loc = self._prior_loc.to(device)
-            self._prior_scale = self._prior_scale.to(device)
-        return self
-
-    def train(self, mode: bool = True):
-        return super().train(mode)
-
-    def eval(self):
-        return super().eval()
