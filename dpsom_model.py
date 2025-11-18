@@ -1,26 +1,6 @@
-import functools
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def lazy_scope(function):
-    """
-    Preserves the original API surface by caching property-like calls.
-    In PyTorch, this simply memorizes the method result on first access.
-    Inspired by the original TF version. Variable names preserved.
-    """
-    attribute = "_cache_" + function.__name__
-
-    @property
-    @functools.wraps(function)
-    def decorator(self):
-        if not hasattr(self, attribute):
-            setattr(self, attribute, function(self))
-        return getattr(self, attribute)
-
-    return decorator
 
 
 class DPSOM(nn.Module):
@@ -73,9 +53,8 @@ class DPSOM(nn.Module):
 
         # SOM embeddings: shape [H, W, latent_dim] as in TF
         H, W = self.som_dim[0], self.som_dim[1]
-        self._embeddings = nn.Parameter(
-            torch.empty(H, W, self.latent_dim)
-        )
+        self._embeddings = nn.Parameter(torch.empty(H, W, self.latent_dim))
+
         # Truncated normal-like init (approx) to match tf.truncated_normal_initializer(stddev=0.05)
         with torch.no_grad():
             self._embeddings.normal_(mean=0.0, std=0.05)
@@ -84,7 +63,7 @@ class DPSOM(nn.Module):
         # Encoder and decoder
         if not self.convolution:
             # Non-convolutional encoder
-            self.enc_fc1 = nn.Linear(28*28, 500)
+            self.enc_fc1 = nn.Linear(28 * 28, 500)
             self.enc_drop1 = nn.Dropout(dropout)
             self.enc_bn1 = nn.BatchNorm1d(500, eps=1e-3, momentum=0.01, affine=True, track_running_stats=True)
 
@@ -99,7 +78,7 @@ class DPSOM(nn.Module):
             self.enc_mu = nn.Linear(2000, latent_dim)
             self.enc_logvar = nn.Linear(2000, latent_dim)
 
-            # decoder
+            # Decoder
             self.dec_fc4 = nn.Linear(latent_dim, 2000)
             self.dec_bn4 = nn.BatchNorm1d(2000, eps=1e-3, momentum=0.01, affine=True, track_running_stats=True)
             self.dec_fc3 = nn.Linear(2000, 500)
@@ -135,46 +114,19 @@ class DPSOM(nn.Module):
             self.dec_conv_out = nn.Conv2d(32, 1, kernel_size=3, padding=1)
             self.dec_up = nn.Upsample(scale_factor=2, mode="nearest")
 
-        # Training state and counters (preserve names)
-        self._global_step = 0     # mirrors TF global_step
+        self._train_epoch = 0
 
-        # Placeholder-like attributes to preserve names used in the script
         self._p_tensor = None  # target distribution p (set externally each batch)
-        self._z_placeholder = None  # kept as stub for API compatibility
+        self.z_e = None
+        self.z_e_ng = None
+        self.mu = None
+        self.logvar = None
 
-        # Expose attributes names to mirror original file (lazy properties)
-        self.input_dim
-        self.embeddings
-        self.global_step
-        self.z_e
-        self.sample_z_e
-        self.z_dist_flat
-        self.k
-        self.z_q
-        self.z_q_neighbors
-        self.reconstruction_e
-        self.loss_reconstruction_ze
-        self.p
-        self.q
-        self.loss_commit
-        self.loss_commit_s
-        self.loss_som_s
-        self.loss_som
-        self.loss
-        self.loss_a
-        self.optimize  # will be used externally in the training script
+    def get_epoch(self):
+        return self._train_epoch
 
-    @lazy_scope
-    def input_dim(self):
-        return 28 * 28
-
-    @lazy_scope
-    def embeddings(self):
-        return self._embeddings
-
-    @lazy_scope
-    def global_step(self):
-        return self._global_step
+    def inc_epoch(self):
+        self._train_epoch += 1
 
     # ====== Encoder/Decoder helpers ======
 
@@ -227,7 +179,7 @@ class DPSOM(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def _decode_logits(self, z):
+    def _decode(self, z):
         if not self.convolution:
             h = F.leaky_relu(self.dec_fc4(z), negative_slope=0.2)
             h = self.dec_bn4(h)
@@ -235,7 +187,8 @@ class DPSOM(nn.Module):
             h = self.dec_bn3(h)
             h = F.leaky_relu(self.dec_fc2(h), negative_slope=0.2)
             h = self.dec_bn2(h)
-            logits = self.dec_fc1(h)  # [B, 784]
+            logits_linear = self.dec_fc1(h)
+            logits = F.leaky_relu(logits_linear, negative_slope=0.2)
             return logits
         else:
             h = self.dec_fc(z)
@@ -252,32 +205,25 @@ class DPSOM(nn.Module):
             logits = logits_map.view(z.shape[0], 28 * 28)
             return logits
 
-    # ===== Properties and methods with original names =====
+    # ====== Latent sampling and distances ======
 
-    @lazy_scope
-    def z_e(self):
-        # Cache struct for mu/logvar
-        return {"mu": None, "logvar": None}
-
-    def sample_z_e(self, x):
-        """
-        Sample from q(z|x) and store mu/logvar under the same name structure.
-        """
+    def compute_z_e(self, x):
         mu, logvar = self._encode(x)
-        z = self._reparameterize(mu, logvar)
-        self._cache_z_e = {"mu": mu, "logvar": logvar}
-        return z  # [B, D]
+        eps = torch.randn_like(mu)
+        z = mu + eps * torch.exp(0.5 * logvar)
+        self.z_e = z
+        self.z_e_ng = z.detach()
+        self.mu = mu
+        self.logvar = logvar
 
     def z_dist_flat(self, x, stop_grad=False):
         """
         Compute squared distances between embeddings and latent samples.
         Returns [B, H*W].
         """
-        z = self.sample_z_e(x)
-        if stop_grad:
-            z = z.detach()
+        z = self.z_e_ng if stop_grad else self.z_e
         H, W = self.som_dim[0], self.som_dim[1]
-        E = self.embeddings  # [H, W, D]
+        E = self._embeddings  # [H, W, D]
         z_exp = z[:, None, None, :]  # [B,1,1,D]
         diff = z_exp - E[None, :, :, :]  # [B,H,W,D]
         z_dist = (diff * diff).sum(dim=-1)  # [B,H,W]
@@ -296,7 +242,7 @@ class DPSOM(nn.Module):
 
     def z_q(self, x):
         """
-        Aggregate the closest centroid for every embedding. Returns [B, D]
+        Aggregate closest centroid for every embedding. Returns [B, D]
 
         For each sample in the batch, finds the nearest SOM centroid
         and returns its embedding vector.
@@ -309,24 +255,24 @@ class DPSOM(nn.Module):
         k = self.k(x)  # [B]
         k1 = k // W
         k2 = k % W
-        # Gather the centroid embeddings [H, W, D]
-        gathered = self.embeddings[k1, k2, :]  # [B, D]
+        gathered = self._embeddings[k1, k2, :]  # [B, D]
         return gathered
 
-    def z_q_neighbors(self, x):
+    def som_neighbors(self, k):
         """
-        Aggregate neighbor centroids in the SOM grid for each z_q.
-        Returns [B, 5, D] = [center, up, down, right, left]
+        SOM neighbors (up, down, right, left) for k.
+        k: LongTensor [N]
         """
         H, W = self.som_dim[0], self.som_dim[1]
-        k = self.k(x)  # [B]
-        k1 = k // W  # Row index
-        k2 = k % W  # Column index
+
+        k1 = k // W
+        k2 = k % W
+
         if self.toroidal:
-            k1_up = (k1 + 1) % H  # Wraps at bottom
-            k1_down = (k1 - 1) % H  # Wraps at top
-            k2_right = (k2 + 1) % W  # Wraps at left
-            k2_left = (k2 - 1) % W  # Wraps at right
+            k1_up = torch.remainder(k1 + 1, H)
+            k1_down = torch.remainder(k1 - 1, H)
+            k2_right = torch.remainder(k2 + 1, W)
+            k2_left = torch.remainder(k2 - 1, W)
         else:
             k1_not_top = (k1 < (H - 1))
             k1_not_bottom = (k1 > 0)
@@ -338,22 +284,41 @@ class DPSOM(nn.Module):
             k2_right = torch.where(k2_not_right, k2 + 1, torch.zeros_like(k2))
             k2_left = torch.where(k2_not_left, k2 - 1, torch.ones_like(k2) * (W - 1))
 
-        z_center = self.embeddings[k1, k2, :]  # [B, D]
-        z_up = self.embeddings[k1_up, k2, :]  # [B, D]
-        z_down = self.embeddings[k1_down, k2, :]  # [B, D]
-        z_right = self.embeddings[k1, k2_right, :]  # [B, D]
-        z_left = self.embeddings[k1, k2_left, :]  # [B, D]
+        k_up = k1_up * W + k2
+        k_down = k1_down * W + k2
+        k_right = k1 * W + k2_right
+        k_left = k1 * W + k2_left
 
-        return torch.stack([z_center, z_up, z_down, z_right, z_left], dim=1)  # [B, 5, D]
+        return k_up, k_down, k_right, k_left
 
-    def reconstruction_e(self, x):
+    def z_q_neighbors(self, x):
         """
-        Reconstruct input from encodings with Bernoulli likelihood over pixels.
-        Returns logits [B, 784].
+        Aggregate neighbor centroids in the SOM grid for each z_q.
+        Returns [B, 5, D] = [center, up, down, right, left]
         """
-        z = self.sample_z_e(x)
-        logits = self._decode_logits(z)  # [B,784]
-        return logits
+        H, W = self.som_dim[0], self.som_dim[1]
+        k = self.k(x)  # [B]
+
+        k_up, k_down, k_right, k_left = self.som_neighbors(k)
+
+        k1 = k // W
+        k2 = k % W
+        k1_up = k_up // W
+        k2_up = k_up % W
+        k1_down = k_down // W
+        k2_down = k_down % W
+        k1_right = k_right // W
+        k2_right = k_right % W
+        k1_left = k_left // W
+        k2_left = k_left % W
+
+        z_center = self._embeddings[k1, k2, :]  # [B, D]
+        z_up = self._embeddings[k1_up, k2_up, :]
+        z_down = self._embeddings[k1_down, k2_down, :]
+        z_right = self._embeddings[k1_right, k2_right, :]
+        z_left = self._embeddings[k1_left, k2_left, :]
+
+        return torch.stack([z_center, z_up, z_down, z_right, z_left], dim=1)  # [B,5,D]
 
     def _kl_divergence_diag(self, mu, logvar):
         """
@@ -362,7 +327,6 @@ class DPSOM(nn.Module):
         """
         prior_scale = self._prior_scale.to(mu.device)
         prior_var = prior_scale.pow(2)
-
         var_q = torch.exp(logvar)
         kl = 0.5 * (
             (var_q / prior_var).sum(dim=1)
@@ -372,14 +336,20 @@ class DPSOM(nn.Module):
         )
         return kl.mean()
 
+    def loss_reconstruction_vae(self, x):
+        self.compute_z_e(x)
+        return self.loss_reconstruction_ze(x)
+
     def loss_reconstruction_ze(self, x):
         """
         Compute ELBO: negative log-likelihood + prior * KL
         Bernoulli likelihood with logits; inputs expected in [0,1].
         """
-        mu, logvar = self._encode(x)
-        z = self._reparameterize(mu, logvar)
-        logits = self._decode_logits(z)  # [B,784]
+
+        z = self.z_e
+        mu = self.mu
+        logvar = self.logvar
+        logits = self._decode(z)  # [B,784]
         x_flat = x.view(x.shape[0], -1).clamp(0.0, 1.0)
 
         loss_pix = F.binary_cross_entropy_with_logits(logits, x_flat, reduction="none")  # [B, 784]
@@ -390,6 +360,21 @@ class DPSOM(nn.Module):
         return loss_rec
 
     def q(self, x, detach_z=False):
+        """
+        Soft assignments between embeddings and centroids (Student's t-kernel).
+        Returns [B, H*W].
+        """
+        if detach_z:
+            dist_flat = self.z_dist_flat_ng(x)
+        else:
+            dist_flat = self.z_dist_flat(x)
+        eps = torch.finfo(dist_flat.dtype).eps
+        q = eps + 1.0 / torch.pow(1.0 + dist_flat / self.alpha, (self.alpha + 1.0) / 2.0)
+        q = q / q.sum(dim=1, keepdim=True)
+        return q
+
+    def q_p(self, x, detach_z=False):
+        self.compute_z_e(x)
         """
         Soft assignments between embeddings and centroids (Student's t-kernel).
         Returns [B, H*W].
@@ -417,10 +402,9 @@ class DPSOM(nn.Module):
         """
         self._p_tensor = p_tensor
 
-    def loss_commit(self, x, eps: float = 1e-8):
+    def loss_commit(self, x, eps: float = 1e-10):
         """
         Commitment loss: KL(P || Q) with per-sample sum, then batch mean.
-        Epsilon is applied by clamping p and q before log to match TF behavior.
         """
         q = self.q(x)                          # [B, K], soft assignments
         p = self.p                              # [B, K], set via set_p() beforehand
@@ -443,25 +427,11 @@ class DPSOM(nn.Module):
     def loss_som(self, x):
         """
         SOM neighbor regularization using detached q for neighbors.
-        Uses row-major indexing with toroidal topology (modulo wrap).
         """
         H, W = self.som_dim[0], self.som_dim[1]
-        k = torch.arange(H * W, device=self.embeddings.device, dtype=torch.long)  # [H*W]
 
-        # Row-major indexing
-        k1 = k // W
-        k2 = k % W
-
-        # Toroidal neighbor wrap (modulo)
-        k1_up = (k1 + 1) % H
-        k1_down = (k1 - 1) % H
-        k2_right = (k2 + 1) % W
-        k2_left = (k2 - 1) % W
-
-        k_up = k1_up * W + k2
-        k_down = k1_down * W + k2
-        k_right = k1 * W + k2_right
-        k_left = k1 * W + k2_left
+        k = torch.arange(H * W, device=self._embeddings.device, dtype=torch.long)  # [H*W]
+        k_up, k_down, k_right, k_left = self.som_neighbors(k)
 
         q_t = self.q(x, detach_z=True).transpose(0, 1)  # [H*W, B]
         q_up = q_t[k_up].transpose(0, 1)
@@ -483,13 +453,17 @@ class DPSOM(nn.Module):
         """
         Aggregate total loss.
         """
-        return self.theta * self.loss_reconstruction_ze(x) + self.gamma * self.loss_commit(x) + self.beta * self.loss_som(x)
+        self.compute_z_e(x)
+        a = self.theta * self.loss_reconstruction_ze(x)
+        b = self.gamma * self.loss_commit(x)
+        c = self.beta * self.loss_som(x)
+        return a + b + c, a, b, c
 
     def loss_commit_s(self, x):
         """
         Commitment loss for standard SOM initialization: ||z - z_q||^2
         """
-        z = self.sample_z_e(x).detach()
+        z = self.z_e_ng
         zq = self.z_q(x)
         return torch.mean((z - zq) ** 2)
 
@@ -497,7 +471,7 @@ class DPSOM(nn.Module):
         """
         SOM neighbor loss for standard SOM initialization: ||z - neighbors||^2
         """
-        z = self.sample_z_e(x).detach().unsqueeze(1)  # [B,1,D]
+        z = self.z_e_ng.unsqueeze(1)  # [B,1,D]
         z_ngb = self.z_q_neighbors(x)  # [B,5,D]
         return torch.mean((z - z_ngb) ** 2)
 
@@ -505,17 +479,11 @@ class DPSOM(nn.Module):
         """
         Clustering loss of standard SOM used for initialization.
         """
-        return self.loss_som_s(x) + self.loss_commit_s(x)
+        self.compute_z_e(x)
+        a = self.loss_som_s(x)
+        b = self.loss_commit_s(x)
+        return a + b, a, b
 
-    @lazy_scope
-    def optimize(self):
-        """
-        Placeholder to preserve original attribute name; in PyTorch the training
-        script will construct optimizers and learning-rate scheduling.
-        """
-        return None
-
-    # Utility to sync prior buffers to device
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
         device = kwargs.get("device", args[0] if len(args) > 0 else None)

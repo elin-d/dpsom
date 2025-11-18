@@ -1,4 +1,3 @@
-# dpsom.py
 """
 PyTorch replacement for the original TensorFlow/TensorFlow-Probability DPSOM implementation,
 Variable names and overall workflow are preserved as closely as possible.
@@ -6,16 +5,13 @@ Variable names and overall workflow are preserved as closely as possible.
 
 import uuid
 from datetime import date
-from pathlib import Path
 from tqdm import tqdm
-import sacred
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
 import numpy as np
 import os
 import time
 import random
-import csv
 import numpy.random as nprand
 
 import torch
@@ -27,56 +23,45 @@ from dpsom_model import DPSOM
 from utils import cluster_purity
 
 # =========================
-# TRAINING SCRIPT (PyTorch)
+# CONFIG SYSTEM (replaces sacred)
 # =========================
 
-ex = sacred.Experiment("hyperopt")
-ex.observers.append(sacred.observers.FileStorageObserver.create("../sacred_runs"))
-ex.captured_out_filter = sacred.utils.apply_backspaces_and_linefeeds
+class DPSOM_Config:
+    def __init__(self):
+        self.num_epochs = 300
+        self.batch_size = 300
+        self.latent_dim = 100
+        self.som_dim = [8, 8]
+        self.learning_rate = 0.001
+        self.learning_rate_pretrain = 0.001
+        self.alpha = 10.0
+        self.beta = 0.4
+        self.gamma = 20
+        self.theta = 1
+        self.epochs_pretrain = 15
+        self.decay_factor = 0.99
+        self.decay_steps = 5000
+        self.name = "hyperopt"
+        self.ex_name = f"{self.name}_{self.latent_dim}_{self.som_dim[0]}-{self.som_dim[1]}_{str(date.today())}_{uuid.uuid4().hex[:5]}"
+        self.logdir = f"logs/{self.ex_name}"
+        self.modelpath = f"models/{self.ex_name}/{self.ex_name}.ckpt"
+        self.data_set = "fMNIST"
+        self.dropout = 0.4
+        self.prior_var = 1
+        self.prior = 0.5
+        self.convolution = False
+        self.use_saved_pretrain = False
+        self.save_pretrain = False
+        self.random_seed = 2020
 
 
-@ex.config
-def ex_config():
-    """
-    Sacred configuration for the experiment.
-    """
-    num_epochs = 300
-    batch_size = 300
-    latent_dim = 100
-    som_dim = [8, 8]
-    learning_rate = 0.001
-    learning_rate_pretrain = 0.001
-    alpha = 7.5
-    beta = 0.25
-    gamma = 20
-    theta = 1
-    epochs_pretrain = 15
-    decay_factor = 0.99
-    decay_steps = 5000
-    name = ex.get_experiment_info()["name"]
-    ex_name = "{}_{}_{}-{}_{}_{}".format(name, latent_dim, som_dim[0], som_dim[1], str(date.today()), uuid.uuid4().hex[:5])
-    logdir = "logs/{}".format(ex_name)
-    modelpath = "models/{}/{}.ckpt".format(ex_name, ex_name)
-    data_set = "MNIST"
-    validation = False
-    dropout = 0.4
-    prior_var = 1
-    prior = 0.5
-    convolution = False
-    val_epochs = False
-    more_runs = False
-    use_saved_pretrain = False
-    save_pretrain = False
-    random_seed = 2020
-    exp_output = False  # Output to Google Cloud File System
-    exp_path = "data/variational_psom/static_clustering_FMNIST/robustness"
+config = DPSOM_Config()
 
 
 def _get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-@ex.capture
 def get_data_generator(data_train, data_val, labels_train, labels_val, data_test, labels_test):
     """
     Creates a data generator for the training that yields numpy arrays,
@@ -113,33 +98,29 @@ def _ensure_dir_for_model(modelpath):
         os.makedirs(d, exist_ok=True)
 
 
-@ex.capture
+# =========================
+# TRAINING SCRIPT (PyTorch)
+# =========================
+
 def train_model(
     model,
     data_train,
     data_val,
     generator,
     lr_val,
-    num_epochs,
-    batch_size,
-    logdir,
-    ex_name,
-    validation,
-    val_epochs,
-    modelpath,
-    learning_rate,
-    epochs_pretrain,
-    som_dim,
-    latent_dim,
-    use_saved_pretrain,
-    learning_rate_pretrain,
-    save_pretrain,
-    alpha,
-    beta,
-    gamma,
-    theta,
-    decay_factor,
-    decay_steps
+    num_epochs=config.num_epochs,
+    batch_size=config.batch_size,
+    logdir=config.logdir,
+    ex_name=config.ex_name,
+    modelpath=config.modelpath,
+    learning_rate=config.learning_rate,
+    epochs_pretrain=config.epochs_pretrain,
+    som_dim=config.som_dim,
+    use_saved_pretrain=config.use_saved_pretrain,
+    learning_rate_pretrain=config.learning_rate_pretrain,
+    save_pretrain=config.save_pretrain,
+    decay_factor=config.decay_factor,
+    decay_steps=config.decay_steps
 ):
     """
     Trains the DPSOM model using PyTorch, preserving the original three-phase workflow.
@@ -153,7 +134,7 @@ def train_model(
     test_writer = SummaryWriter(logdir + "/test")
 
     # Optimizers: three heads to mirror original
-    train_step_VARPSOM = optim.Adam(model.parameters(), lr=learning_rate)
+    train_step_psom = optim.Adam(model.parameters(), lr=learning_rate)
     train_step_vae = optim.Adam(model.parameters(), lr=learning_rate_pretrain)
     train_step_som = optim.Adam(model.parameters(), lr=0.9)
 
@@ -164,10 +145,10 @@ def train_model(
         staircase=True
     )
 
-    model._global_step = 0
+    step = 0
 
     train_gen = generator("train", batch_size)
-    val_gen = generator("val" if validation else "test", batch_size)
+    val_gen = generator("val", batch_size)
 
     len_data_train = len(data_train)
     len_data_val = len(data_val)
@@ -175,16 +156,17 @@ def train_model(
 
     # Pretraining
     test_losses = []
-    test_losses_mean = []
 
     print("\n**********Starting job {}*********\n".format(ex_name))
     pbar = tqdm(total=(num_epochs + epochs_pretrain + 40) * num_batches)
 
+    pretrain_modelpath = f"models/pretrain.ckpt"
+
     # Pretraining
-    if use_saved_pretrain and os.path.exists(modelpath):
+    if use_saved_pretrain and os.path.exists(pretrain_modelpath):
         print("\n\nUsing Saved Pretraining...\n")
-        ckpt = torch.load(modelpath, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        ckpt = torch.load(pretrain_modelpath, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=False)
     else:
         print("\n\nAutoencoder Pretraining...\n")
         model.train()
@@ -202,30 +184,23 @@ def train_model(
                     g["lr"] = float(learning_rate_pretrain)
 
                 train_step_vae.zero_grad()
-                loss_rec = model.loss_reconstruction_ze(x_batch)
+                loss_rec = model.loss_reconstruction_vae(x_batch)
                 loss_rec.backward()
                 train_step_vae.step()
+
+                train_elbo = loss_rec.item()
+                train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
+                train_log_lik = train_elbo - model.prior * train_kl
 
                 if i % 100 == 0:
                     batch_val, _, _ = next(val_gen)
                     x_val = _np_to_torch(batch_val, device)
                     with torch.no_grad():
                         # Compute ELBO (reconstruction + KL)
-                        val_elbo = model.loss_reconstruction_ze(x_val).item()
-                        train_elbo = model.loss_reconstruction_ze(x_batch).item()
-
-                        # Get mu and logvar to compute KL separately
-                        mu_val, logvar_val = model._encode(x_val)
-                        val_kl = model._kl_divergence_diag(mu_val, logvar_val).item()
-
-                        mu_train, logvar_train = model._encode(x_batch)
-                        train_kl = model._kl_divergence_diag(mu_train, logvar_train).item()
-
-                        # Reconstruction log-likelihood only (ELBO - prior*KL)
+                        val_elbo = model.loss_reconstruction_vae(x_val).item()
+                        val_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
                         val_log_lik = val_elbo - model.prior * val_kl
-                        train_log_lik = train_elbo - model.prior * train_kl
 
-                    step = model._global_step
                     # Log with TensorFlow naming convention
                     test_writer.add_scalar("loss/loss_elbo", val_elbo, step)
                     test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", val_kl, step)
@@ -236,7 +211,7 @@ def train_model(
                     train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss", train_log_lik, step)
 
                     pbar.set_postfix(epoch=epoch, train_loss=train_elbo, test_loss=val_elbo, refresh=False)
-                model._global_step += 1
+                step += 1
                 pbar.update(1)
 
         # SOM initialization: multiple passes with decreasing learning rates
@@ -254,7 +229,7 @@ def train_model(
                         g["lr"] = float(lr_phase)
 
                     train_step_som.zero_grad()
-                    loss_init = model.loss_a(x_batch)
+                    loss_init, loss_som_s, loss_commit_s = model.loss_a(x_batch)
                     loss_init.backward()
                     train_step_som.step()
 
@@ -262,17 +237,34 @@ def train_model(
                         batch_val, _, _ = next(val_gen)
                         x_val = _np_to_torch(batch_val, device)
                         with torch.no_grad():
-                            val_l = model.loss_a(x_val).item()
-                            train_l = model.loss_a(x_batch).item()
-                        step = model._global_step
-                        test_writer.add_scalar("loss_a", val_l, step)
-                        train_writer.add_scalar("loss_a", train_l, step)
-                        pbar.set_postfix(epoch=epoch, train_loss=train_l, test_loss=val_l, refresh=False)
-                    model._global_step += 1
+                            loss_elbo = model.loss_reconstruction_vae(x_batch)
+                            loss_init, loss_som_s, loss_commit_s = model.loss_a(x_batch)
+                            train_elbo = loss_elbo.item()
+                            train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
+                            train_log_lik = train_elbo - model.prior * train_kl
+                            val_loss_elbo = model.loss_reconstruction_vae(x_val)
+                            test_elbo = val_loss_elbo.item()
+                            val_loss_init, val_loss_som_s, val_loss_commit_s = model.loss_a(x_val)
+                            test_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
+                            test_log_lik = test_elbo - model.prior * test_kl
+                        test_writer.add_scalar("loss/loss_elbo", test_elbo, step)
+                        train_writer.add_scalar("loss/loss_elbo", train_elbo, step)
+                        test_writer.add_scalar("loss_commit_s/loss_commit_s", val_loss_commit_s.item(), step)
+                        test_writer.add_scalar("loss_som_s/loss_som_s", val_loss_som_s.item(), step)
+                        train_writer.add_scalar("loss_commit_s/loss_commit_s",loss_commit_s.item(), step)
+                        train_writer.add_scalar("loss_som_s/loss_som_s", loss_som_s.item(), step)
+                        test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", train_kl, step)
+                        test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss",
+                                                train_log_lik, step)
+                        train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", train_kl, step)
+                        train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss",
+                                                train_log_lik, step)
+                        pbar.set_postfix(epoch=epoch, train_loss=loss_init.item(), test_loss=val_loss_init.item(), refresh=False)
+                    step += 1
                     pbar.update(1)
 
         if save_pretrain:
-            torch.save({"model": model.state_dict()}, modelpath)
+            torch.save({"model": model.state_dict()}, pretrain_modelpath)
 
     # Main training
     print("\n\nTraining...\n")
@@ -282,20 +274,28 @@ def train_model(
         # Compute initial soft probabilities q over full train to build target distribution p_t
         model.eval()
         with torch.inference_mode():
+            # ---- compute q for training set ----
+            chunk_size = 5000
             q_list = []
-            for t in range(9):
-                sl = slice(int(len(data_train) / 10) * t, int(len(data_train) / 10) * (t + 1))
-                x_t = _np_to_torch(data_train[sl], device)
-                q_t = model.q(x_t).cpu().numpy()
-                q_list.append(q_t)
-            sl = slice(int(len(data_train) / 10) * 9, len(data_train))
-            x_t = _np_to_torch(data_train[sl], device)
-            q_t = model.q(x_t).cpu().numpy()
-            q_list.append(q_t)
+
+            for start in range(0, len(data_train), chunk_size):
+                end = start + chunk_size
+                x_chunk = _np_to_torch(data_train[start:end], device)
+                q_list.append(model.q_p(x_chunk).cpu().numpy())
+
             q = np.concatenate(q_list, axis=0)
 
+            # target distribution for full train set
             ppt = model.target_distribution(q)
-            qv = model.q(_np_to_torch(data_val, device)).cpu().numpy()
+
+            # ---- compute q for validation ----
+            qv_list = []
+            for start in range(0, len(data_val), chunk_size):
+                end = start + chunk_size
+                x_chunk = _np_to_torch(data_val[start:end], device)
+                qv_list.append(model.q_p(x_chunk).cpu().numpy())
+
+            qv = np.concatenate(qv_list, axis=0)
             ppv = model.target_distribution(qv)
 
         for i in range(num_batches):
@@ -307,61 +307,57 @@ def train_model(
             model.set_p(p_batch)
 
             # Adjust train LR
-            new_lr = scheduler.get_lr(model._global_step)
-            for g in train_step_VARPSOM.param_groups:
+            new_lr = scheduler.get_lr(step)
+            for g in train_step_psom.param_groups:
                 g["lr"] = new_lr
 
-            train_step_VARPSOM.zero_grad()
-            loss_total = model.loss(x_batch)
+            train_step_psom.zero_grad()
+            loss_total, loss_elbo, loss_commit, loss_som = model.loss(x_batch)
             loss_total.backward()
-            train_step_VARPSOM.step()
+            train_step_psom.step()
+
+            # Compute for training batch
+            train_loss = loss_total.item()
+            train_elbo = loss_elbo.item()
+            train_commit = loss_commit.item()
+            train_som = loss_som.item()
+            train_commit_s = model.loss_commit_s(x_batch).item()
+            train_som_s = model.loss_som_s(x_batch).item()
+
+            train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
+            train_log_lik = train_elbo - model.prior * train_kl
+
+            train_loss_commit = train_commit
+            train_loss_som = train_som
 
             with torch.inference_mode():
-                # Compute for training batch
-                train_loss = loss_total.item()
-                train_elbo = model.loss_reconstruction_ze(x_batch).item()
-                train_commit = model.loss_commit(x_batch).item()
-                train_som = model.loss_som(x_batch).item()
-                train_commit_s = model.loss_commit_s(x_batch).item()
-                train_som_s = model.loss_som_s(x_batch).item()
+                # Validation loss and logging (safe, no side effects)
+                batch_val, _, ii_v = next(val_gen)
+                x_val = _np_to_torch(batch_val, device)
+                p_val = torch.from_numpy(ppv[ii_v * batch_size: (ii_v + 1) * batch_size]).float().to(device)
+                model.set_p(p_val)
 
-                mu_train, logvar_train = model._encode(x_batch)
-                train_kl = model._kl_divergence_diag(mu_train, logvar_train).item()
-                train_log_lik = train_elbo - model.prior * train_kl
-
-                train_loss_commit = train_commit * model.gamma
-                train_loss_som = train_som * model.beta
-
-            # Validation loss and logging (safe, no side effects)
-            batch_val, _, ii_v = next(val_gen)
-            x_val = _np_to_torch(batch_val, device)
-            p_val = torch.from_numpy(ppv[ii_v * batch_size: (ii_v + 1) * batch_size]).float().to(device)
-            model.set_p(p_val)
-
-            with torch.inference_mode():
                 # Compute all component losses for validation
-                test_loss = model.loss(x_val).item()
-                test_elbo = model.loss_reconstruction_ze(x_val).item()
-                test_commit = model.loss_commit(x_val).item()
-                test_som = model.loss_som(x_val).item()
+                val_loss, val_elbo, val_commit, val_som = model.loss(x_val)
+                test_loss = val_loss.item()
+                test_elbo = val_elbo.item()
+                test_commit = val_commit.item()
+                test_som = val_som.item()
                 test_commit_s = model.loss_commit_s(x_val).item()
                 test_som_s = model.loss_som_s(x_val).item()
 
                 # Get KL and log-likelihood separately
-                mu_val, logvar_val = model._encode(x_val)
-                test_kl = model._kl_divergence_diag(mu_val, logvar_val).item()
+                test_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
                 test_log_lik = test_elbo - model.prior * test_kl
 
                 # For progress display (weighted losses)
-                elbo_loss = model.theta * test_elbo
-                cah_loss = model.gamma * test_commit
-                ssom_loss = model.beta * test_som
+                elbo_loss = test_elbo
+                cah_loss = test_commit
+                ssom_loss = test_som
 
             test_losses.append(test_loss)
 
             if i % 100 == 0:
-                step = model._global_step
-
                 # Test writer - all TensorFlow scalars
                 test_writer.add_scalar("loss/loss", test_loss, step)
                 test_writer.add_scalar("loss/loss_elbo", elbo_loss, step)
@@ -404,49 +400,34 @@ def train_model(
                     refresh=False
                 )
 
-            if i % 1000 == 0 and len(test_losses) > 0:
-                test_losses_mean.append(np.mean(test_losses))
-                test_losses = []
-
-            model._global_step += 1
+            step += 1
             pbar.update(1)
 
         # Save checkpoint per epoch
         torch.save({"model": model.state_dict()}, modelpath)
-
-        # Optional evaluation every 10 epochs
-        if val_epochs and ((epoch + 1) % 10 == 0):
-            results = evaluate_model(model, generator, len_data_val)
-            if results is None:
-                return None
-
-    # Final evaluation
-    results = evaluate_model(model, generator, len_data_val)
-    return results
+        model.inc_epoch()
 
 
-@ex.capture
 def evaluate_model(
     model,
+    data_test,
     generator,
-    len_data_val,
-    batch_size,
-    latent_dim,
-    som_dim,
-    learning_rate,
-    alpha,
-    gamma,
-    beta,
-    theta,
-    epochs_pretrain,
-    decay_factor,
-    ex_name,
-    data_set,
-    validation,
-    dropout,
-    prior_var,
-    prior,
-    convolution,
+    batch_size=config.batch_size,
+    latent_dim=config.latent_dim,
+    som_dim=config.som_dim,
+    learning_rate=config.learning_rate,
+    alpha=config.alpha,
+    gamma=config.gamma,
+    beta=config.beta,
+    theta=config.theta,
+    epochs_pretrain=config.epochs_pretrain,
+    decay_factor=config.decay_factor,
+    ex_name=config.ex_name,
+    data_set=config.data_set,
+    dropout=config.dropout,
+    prior_var=config.prior_var,
+    prior=config.prior,
+    convolution=config.convolution
 ):
     """
     Evaluates the trained model (NMI, AMI, Purity), preserving output format and files.
@@ -457,16 +438,18 @@ def evaluate_model(
 
     test_k_all = []
     labels_val_all = []
-    print("Evaluation...")
+    print("\n\nEvaluation...\n")
 
+    val_gen = generator("test", batch_size)
+    len_data_val = len(data_test)
     num_batches = len_data_val // batch_size
-    val_gen = generator("val" if validation else "test", batch_size)
 
     with torch.no_grad():
         for _ in range(num_batches):
             batch_data, batch_labels, _ii = next(val_gen)
             labels_val_all.extend(batch_labels.tolist() if hasattr(batch_labels, "tolist") else list(batch_labels))
             x_val = _np_to_torch(batch_data, device)
+            model.compute_z_e(x_val)
             k_pred = model.k(x_val).cpu().numpy().tolist()
             test_k_all.extend(k_pred)
 
@@ -491,7 +474,7 @@ def evaluate_model(
             "Epochs= %d, som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, beta=%f, gamma=%f, "
             "theta=%f, alpha=%f, dropout=%f, decay_factor=%f, prior_var=%f, prior=%f, epochs_pretrain=%d"
             % (
-                0,  # epoch count not tracked here; keep placeholder to preserve format
+                model.get_epoch(),  # epoch count not tracked here; keep placeholder to preserve format
                 som_dim[0],
                 som_dim[1],
                 latent_dim,
@@ -513,46 +496,22 @@ def evaluate_model(
     return results
 
 
-@ex.automain
-def main(
-    latent_dim,
-    som_dim,
-    learning_rate,
-    decay_factor,
-    alpha,
-    beta,
-    gamma,
-    theta,
-    ex_name,
-    more_runs,
-    data_set,
-    dropout,
-    prior_var,
-    convolution,
-    prior,
-    validation,
-    epochs_pretrain,
-    num_epochs,
-    batch_size,
-    random_seed,
-    exp_output,
-    exp_path,
-):
+def main(config=config):
     """
     Builds the model, prepares data, trains, and evaluates; variable names and workflow preserved.
     """
     # Seeding
-    random.seed(random_seed)
-    nprand.seed(random_seed)
-    torch.manual_seed(random_seed)
+    random.seed(config.random_seed)
+    nprand.seed(config.random_seed)
+    torch.manual_seed(config.random_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(random_seed)
+        torch.cuda.manual_seed_all(config.random_seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
     start = time.time()
-    if not os.path.exists("../models"):
-        os.mkdir("../models")
+    if not os.path.exists("./models"):
+        os.mkdir("./models")
 
     # Dimensions for MNIST-like data
     input_length = 28
@@ -560,36 +519,36 @@ def main(
 
     # Build model
     model = DPSOM(
-        latent_dim=latent_dim,
-        som_dim=som_dim,
-        learning_rate=learning_rate,
-        alpha=alpha,
-        decay_factor=decay_factor,
+        latent_dim=config.latent_dim,
+        som_dim=config.som_dim,
+        learning_rate=config.learning_rate,
+        alpha=config.alpha,
+        decay_factor=config.decay_factor,
         input_length=input_length,
         input_channels=input_channels,
-        beta=beta,
-        theta=theta,
-        gamma=gamma,
-        convolution=convolution,
-        dropout=dropout,
-        prior_var=prior_var,
-        prior=prior,
+        beta=config.beta,
+        theta=config.theta,
+        gamma=config.gamma,
+        convolution=config.convolution,
+        dropout=config.dropout,
+        prior_var=config.prior_var,
+        prior=config.prior,
     )
 
     # Load data (replace tf.keras datasets with torchvision tensors and then numpy)
     from torchvision import datasets
 
-    if data_set == "MNIST":
-        train_ds = datasets.MNIST(root="../data", train=True, download=True)
-        test_ds = datasets.MNIST(root="../data", train=False, download=True)
+    if config.data_set == "MNIST":
+        train_ds = datasets.MNIST(root="./data", train=True, download=True)
+        test_ds = datasets.MNIST(root="./data", train=False, download=True)
 
         data_total = train_ds.data.numpy().astype(np.float32)  # [N,28,28]
         labels_total = train_ds.targets.numpy().astype(np.int64)
         data_test = test_ds.data.numpy().astype(np.float32)
         labels_test = test_ds.targets.numpy().astype(np.int64)
     else:
-        train_ds = datasets.FashionMNIST(root="../data", train=True, download=True)
-        test_ds = datasets.FashionMNIST(root="../data", train=False, download=True)
+        train_ds = datasets.FashionMNIST(root="data/", train=True, download=True)
+        test_ds = datasets.FashionMNIST(root="data/", train=False, download=True)
 
         data_total = train_ds.data.numpy().astype(np.float32)
         labels_total = train_ds.targets.numpy().astype(np.int64)
@@ -605,81 +564,20 @@ def main(
     maxx_t = np.maximum(np.reshape(np.amax(data_test_flat, axis=-1), [-1, 1]), 1.0)
     data_test = (data_test_flat / maxx_t).reshape(-1, 28, 28, 1)
 
-    data_train, data_val, labels_train, labels_val = train_test_split(
-        data_total, labels_total, test_size=0.15, random_state=42
-    )
+    data_train, data_val, labels_train, labels_val = train_test_split(data_total, labels_total, test_size=0.15,
+                                                                      random_state=42)
 
     data_generator = get_data_generator(data_train, data_val, labels_train, labels_val, data_test, labels_test)
-    if not validation:
-        data_val = data_test
 
-    # Training runs
-    if more_runs:
-        NMI = []
-        PUR = []
-        for _ in range(10):
-            results = train_model(model, data_train, data_val, data_generator, lr_val=learning_rate)
-            if results is None:
-                continue
-            NMI.append(results["NMI"])
-            PUR.append(results["Purity"])
-
-        NMI_mean = float(np.mean(NMI)) if len(NMI) > 0 else 0.0
-        NMI_sd = float(np.std(NMI) / np.sqrt(max(len(NMI), 1)))
-        PUR_mean = float(np.mean(PUR)) if len(PUR) > 0 else 0.0
-        PUR_sd = float(np.std(PUR) / np.sqrt(max(len(PUR), 1)))
-
-        print("\nRESULTS NMI: %f +- %f, PUR: %f +- %f. Name: %r.\n" % (NMI_mean, NMI_sd, PUR_mean, PUR_sd, ex_name))
-
-        if data_set == "MNIST":
-            f = open("evaluation_MNIST.txt", "a+")
-        else:
-            f = open("evaluation_fMNIST.txt", "a+")
-        f.write(
-            "som_dim=[%d,%d], latent_dim= %d, batch_size= %d, learning_rate= %f, theta= %f, "
-            "dropout=%f, prior=%f, gamma=%f, beta%f, epochs_pretrain=%d, epochs= %d"
-            % (
-                som_dim[0],
-                som_dim[1],
-                latent_dim,
-                batch_size,
-                learning_rate,
-                theta,
-                dropout,
-                prior,
-                gamma,
-                beta,
-                epochs_pretrain,
-                num_epochs,
-            )
-        )
-        f.write(", RESULTS NMI: %f + %f, PUR: %f + %f. Name: %r \n" % (NMI_mean, NMI_sd, PUR_mean, PUR_sd, ex_name))
-        f.close()
-        results = {"NMI": NMI_mean, "Purity": PUR_mean, "AMI": 0.0}
-    else:
-        results = train_model(model, data_train, data_val, data_generator, lr_val=learning_rate)
-        if results is not None:
-            print("\n NMI: {}, AMI: {}, PUR: {}. Name: {}.\n".format(results["NMI"], results["AMI"], results["Purity"], ex_name))
-
-        # Optional export
-        if exp_output and results is not None:
-            lock_path = os.path.join(
-                exp_path,
-                "exp_beta_{:.4f}_gamma_{:.4f}_bsize_{}_seed_{}_epochs_{}.LOCK".format(
-                    beta, gamma, batch_size, random_seed, num_epochs
-                ),
-            )
-            Path(lock_path).touch()
-            out_path = os.path.join(
-                exp_path, "exp_beta_{:.4f}_gamma_{:.4f}_bsize_{}_seed_{}_epochs_{}.tsv".format(beta, gamma, batch_size, random_seed, num_epochs)
-            )
-            with open(out_path, "w") as out_fp:
-                csv_fp = csv.writer(out_fp, delimiter="\t")
-                csv_fp.writerow(["DATASET", "NMI", "AMI", "Purity"])
-                csv_fp.writerow([data_set, str(results["NMI"]), str(results["AMI"]), str(results["Purity"])])
-            if os.path.exists(lock_path):
-                os.remove(lock_path)
+    train_model(model, data_train, data_val, data_generator, lr_val=config.learning_rate)
+    results = evaluate_model(model, data_test, data_generator)
+    if results is not None:
+        print(f"NMI: {results['NMI']}, AMI: {results['AMI']}, PUR: {results['Purity']}. Name: {config.ex_name}.")
 
     elapsed_time_fl = (time.time() - start)
     print("\n Time: {}".format(elapsed_time_fl))
     return results
+
+
+if __name__ == "__main__":
+    main()
