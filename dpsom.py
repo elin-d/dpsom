@@ -50,6 +50,7 @@ class DPSOM_Config:
         self.use_saved_pretrain = False
         self.save_pretrain = False
         self.random_seed = 2020
+        self.toroidal = True
 
 config = DPSOM_Config()
 
@@ -231,12 +232,11 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
     train_writer, test_writer = writers
     print("\n\nTraining...\n")
     lratios, l2ratios, l3ratios = [], [], []
-    test_losses = []
 
     for epoch in range(num_epochs):
         ppt = _compute_target_distribution(model, data_train, device)
         ppv = _compute_target_distribution(model, data_val, device)
-
+        model.train()
         for i in range(num_batches):
             batch_data, _, ii = next(train_gen)
             x_batch = _np_to_torch(batch_data, device)
@@ -286,7 +286,6 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
                 cah_loss = test_commit
                 ssom_loss = test_som
 
-            test_losses.append(test_loss)
 
             if i % 100 == 0:
                 test_writer.add_scalar("loss/loss", test_loss, step)
@@ -314,11 +313,10 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
                 l2ratios.append(vae_cah_ratio)
                 l3ratios.append(clust_vae_ratio)
 
-                test_s = np.mean(test_losses) if len(test_losses) > 0 else test_loss
                 pbar.set_postfix(
                     epoch=epoch,
                     train_loss=loss_total.item(),
-                    test_loss=test_s,
+                    test_loss=test_loss,
                     ssom=ssom_loss,
                     cah=cah_loss,
                     vae=elbo_loss,
@@ -327,7 +325,6 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
                     cr_ratio=(np.mean(l3ratios) if len(l3ratios) > 0 else 0.0),
                     refresh=False
                 )
-
             step += 1
             pbar.update(1)
 
@@ -470,8 +467,8 @@ def evaluate_model(
             batch_data, batch_labels, _ii = next(val_gen)
             labels_val_all.extend(batch_labels.tolist() if hasattr(batch_labels, "tolist") else list(batch_labels))
             x_val = _np_to_torch(batch_data, device)
-            z = model(x_val)
-            k_pred = model.k(z).cpu().numpy().tolist()
+            mu, _ = model._encode(x_val)
+            k_pred = model.k(mu).cpu().numpy().tolist()
             test_k_all.extend(k_pred)
 
     test_nmi = metrics.normalized_mutual_info_score(np.array(labels_val_all), np.array(test_k_all), average_method="geometric")

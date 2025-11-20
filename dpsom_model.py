@@ -137,17 +137,20 @@ class DPSOM(nn.Module):
             x = x.permute(0, 2, 3, 1).contiguous()  # [B,28,28,1] for uniform handling
         if not self.convolution:
             flat = x.view(x.size(0), -1)
-            h = F.leaky_relu(self.enc_fc1(flat), 0.2)
-            h = self.enc_drop1(h)
+
+            h = self.enc_fc1(flat)
             h = self.enc_bn1(h)
+            h = F.leaky_relu(h, 0.2)
+            h = self.enc_drop1(h)
 
-            h = F.leaky_relu(self.enc_fc2(h), 0.2)
-            h = self.enc_drop2(h)
+            h = self.enc_fc2(h)
             h = self.enc_bn2(h)
+            h = F.leaky_relu(h, 0.2)
+            h = self.enc_drop2(h)
 
-            h = F.leaky_relu(self.enc_fc3(h), 0.2)
-            h = self.enc_drop3(h)
+            h = self.enc_fc3(h)
             h = self.enc_bn3(h)
+            h = F.leaky_relu(h, 0.2)
 
             mu = self.enc_mu(h)
             logvar = self.enc_logvar(h)
@@ -179,14 +182,19 @@ class DPSOM(nn.Module):
 
     def _decode(self, z):
         if not self.convolution:
-            h = F.leaky_relu(self.dec_fc4(z), negative_slope=0.2)
+            h = self.dec_fc4(z)
             h = self.dec_bn4(h)
-            h = F.leaky_relu(self.dec_fc3(h), negative_slope=0.2)
+            h = F.leaky_relu(h, negative_slope=0.2)
+
+            h = self.dec_fc3(h)
             h = self.dec_bn3(h)
-            h = F.leaky_relu(self.dec_fc2(h), negative_slope=0.2)
+            h = F.leaky_relu(h, negative_slope=0.2)
+
+            h = self.dec_fc2(h)
             h = self.dec_bn2(h)
-            logits_linear = self.dec_fc1(h)
-            logits = F.leaky_relu(logits_linear, negative_slope=0.2)
+            h = F.leaky_relu(h, negative_slope=0.2)
+
+            logits = self.dec_fc1(h)
             return logits
         else:
             h = self.dec_fc(z)
@@ -320,8 +328,7 @@ class DPSOM(nn.Module):
         KL(q || p) with q ~ N(mu, diag(exp(logvar))), p ~ N(0, diag(prior_var))
         Per-sample KL, then mean over batch.
         """
-        prior_scale = self._prior_scale.to(mu.device)
-        prior_var = prior_scale.pow(2)
+        prior_var = self._prior_scale.to(mu.device)
         var_q = torch.exp(logvar)
         kl = 0.5 * (
             (var_q / prior_var).sum(dim=1)
@@ -436,7 +443,7 @@ class DPSOM(nn.Module):
         q_neighbours_log_sum = torch.sum(torch.log(q_neighbours + eps), dim=-1)  # [B, H*W]
 
         new_q = self.q(z)  # [B, H*W]
-        q_n = q_neighbours_log_sum * new_q.detach()
+        q_n = q_neighbours_log_sum * new_q
         q_n = torch.sum(q_n, dim=-1)  # [B]
         qq = -torch.mean(q_n)
         return qq
