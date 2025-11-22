@@ -50,11 +50,11 @@ The implementation includes utilities for:
 Comparison between this PyTorch implementation and the original TensorFlow version (run with `Validation=True`).
 
 | Dataset | Metric | Dense (Torch) | Dense (TF) | Conv (Torch) | Conv (TF) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **MNIST** | **NMI** | **0.6946** | 0.6919 | **0.7267** | 0.6988 |
-| | **Purity** | 0.9520 | **0.9626** | **0.9833** | 0.9676 |
-| **fMNIST** | **NMI** | **0.5673** | 0.5667 | **0.5712** | 0.5667 |
-| | **Purity** | 0.7738 | **0.7809** | 0.7766 | **0.7809** |
+| :--- | :--- |:--------------| :--- | :--- | :--- |
+| **MNIST** | **NMI** | **0.6946**    | 0.6919 | **0.7267** | 0.6988 |
+| | **Purity** | 0.9609        | **0.9626** | **0.9833** | 0.9676 |
+| **fMNIST** | **NMI** | **0.5673**    | 0.5667 | **0.5712** | 0.5667 |
+| | **Purity** | 0.7738        | **0.7809** | 0.7766 | **0.7809** |
 
 ## File Structure
 
