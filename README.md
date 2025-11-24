@@ -1,39 +1,44 @@
-# DPSOM
+# DPSOM: Deep Probabilistic Self-Organizing Map
 
-A PyTorch reimplementation of **Disentangled Probabilistic Self-Organizing Map (DPSOM)**, originally proposed in TensorFlow. This implementation preserves the core methodology while providing a modern PyTorch ecosystem.
+A PyTorch reimplementation of the **Deep Probabilistic Self-Organizing Map (DPSOM)**. This repository provides a native PyTorch implementation of the original model, preserving the core methodology while leveraging the modern ecosystem for improved stability and flexibility.
 
-## Overview
+## Abstract
 
-This repository ports the original TensorFlow 1.x + TensorFlow Probability DPSOM model to native PyTorch while preserving the three‑phase workflow: autoencoder pretraining, SOM initialization, and joint optimization.​
-The port maintains compatible hyperparameters and naming to simplify parity checks and reproducibility across frameworks.
+DPSOM combines the representational power of Variational Autoencoders (VAEs) with the topological clustering capabilities of Self-Organizing Maps (SOMs). This implementation replicates the original three-phase workflow:
+1.  **Autoencoder Pretraining**: Learning a latent representation of the input space.
+2.  **SOM Initialization**: Initializing the map topology based on latent codes.
+3.  **Joint Optimization**: Finetuning the encoder, decoder, and SOM simultaneously.
 
-## Differences vs Original TensorFlow
+## Architectural Implementation
 
-- **Loss Calculation**: The PyTorch model uses explicit mu/logvar and BCE‑with‑logits everywhere.
-- **BatchNorm Fix**: The original TensorFlow order of BatchNorm causes a statistical mismatch between training (sparse data) and inference (dense data), which PyTorch handles strictly, breaking the model. It was reordered to the standard BatchNorm to ensure consistent feature statistics during both training and evaluation, correcting this architectural flaw.
-- **Indexing**: SOM indexing in PyTorch is consistently row‑major with an optional toroidal neighbor policy.
+This repository ports the original architecture to native PyTorch. Key architectural decisions and improvements include:
 
-## Hyperparameter Control
+### 1. Numerical Stability & Loss Calculation
+The PyTorch implementation utilizes explicit mean/log-variance parameterization and `BCEWithLogitsLoss` to ensure numerical stability during backpropagation. This addresses potential gradients issues found in legacy frameworks.
 
-The loss function combines several objectives weighted by these parameters:
+### 2. BatchNorm Rectification
+A critical architectural flaw in the original implementation involved the ordering of Batch Normalization layers, which caused a statistical mismatch between training (sparse data batches) and inference (dense evaluation).
 
+This implementation strictly enforces standard Batch Normalization ordering. This ensures that feature statistics remain consistent during both training and evaluation phases, resulting in more reliable convergence and inference metrics.
+
+### 3. Topology & Indexing
+SOM indexing is implemented using consistent row-major ordering. The model supports optional toroidal neighbor policies to handle edge cases in the map topology.
+
+## Hyperparameters
+
+The global objective function is a weighted sum of distinct loss components. The behavior of the model is controlled by the following hyperparameters:
+ 
 - `prior`: Reconstruction loss weight.
 - `alpha`: **SOM commitment loss weight.** Controls how strongly the SOM embeddings are pulled towards the encoded representations ($z_e$).
 - `beta`: KL divergence regularization (disentanglement factor).
 - `gamma`: Clustering loss weight (SOM probability distribution matching).
 - `theta`: Prior distribution weight.
 
-## Improvements Over Original
-
-- **Native PyTorch Implementation**: Clean integration with PyTorch ecosystem, automatic differentiation, and modern optimizers.
-- **Stability**: Improved numerical stability in loss calculations.
-
 ## Requirements
 
 - torch
 - numpy
 - scikit-learn
-- sacred
 - tqdm
 - tensorboard
 
@@ -63,8 +68,9 @@ Comparison between this PyTorch implementation and the original TensorFlow versi
 - `decay_scheduler.py`: Exponential learning rate decay scheduler
 - `utils.py`: Helper functions including clustering metrics
 
+
 ## Reference
 
-This work is a PyTorch port of the DPSOM architecture and training procedure and references the original TensorFlow implementation for parity and validation
+This work references the original methodology proposed by Manduchi et al.
 
-> Laura Manduchi, Matthias Hüser, Martin Faltys, Julia Vogt, Gunnar Rätsch,and Vincent Fortuin. 2021. T-DPSOM - An Interpretable Clustering Methodfor Unsupervised Learning of Patient Health States. InACM Conference onHealth, Inference, and Learning (ACM CHIL ’21), April 8–10, 2021, VirtualEvent, USA.ACM, New York, NY, USA, 10 pages. https://doi.org/10.1145/3450439.3451872
+> Laura Manduchi, Matthias Hüser, Martin Faltys, Julia Vogt, Gunnar Rätsch, and Vincent Fortuin. (2019). **Deep Probabilistic Self-Organizing Map**. arXiv preprint arXiv:1910.01590. https://arxiv.org/abs/1910.01590

@@ -222,6 +222,7 @@ class DPSOM(nn.Module):
         self.logits = self._decode(z)
         return z
 
+    @torch.compile
     def z_dist_flat(self, z):
         """
         Compute squared distances between embeddings and latent samples.
