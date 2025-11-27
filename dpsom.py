@@ -121,23 +121,24 @@ def _run_pretraining_phase(model, train_gen, val_gen, optimizer, writers, step, 
                 g["lr"] = float(learning_rate_pretrain)
 
             optimizer.zero_grad()
-            z = model(x_batch)
-            loss_rec = model.loss_reconstruction_ze(x_batch)
+            z, mu, logvar = model(x_batch)
+            loss_rec, rc, kl = model.loss_reconstruction_ze(x_batch, mu, logvar)
             loss_rec.backward()
             optimizer.step()
 
             train_elbo = loss_rec.item()
-            train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
-            train_log_lik = train_elbo - model.prior * train_kl
+            train_kl = kl.item()
+            train_log_lik = rc.item()
 
             if i % 100 == 0:
                 batch_val, _, _ = next(val_gen)
                 x_val = _np_to_torch(batch_val, device)
                 with torch.no_grad():
                     model(x_val)
-                    val_elbo = model.loss_reconstruction_ze(x_val).item()
-                    val_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
-                    val_log_lik = val_elbo - model.prior * val_kl
+                    rl, rc, kl = model.loss_reconstruction_ze(x_val, mu, logvar)
+                    val_kl = kl.item()
+                    val_log_lik = rc.item()
+                    val_elbo = rl.item()
 
                 test_writer.add_scalar("loss/loss_elbo", val_elbo, step)
                 test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", val_kl, step)
@@ -172,7 +173,7 @@ def _run_som_initialization_phase(model, train_gen, val_gen, optimizer, writers,
                     g["lr"] = float(lr_phase)
 
                 optimizer.zero_grad()
-                z = model(x_batch)
+                z, mu, logvar = model(x_batch)
                 loss_init, loss_som_s, loss_commit_s = model.loss_a(z)
                 loss_init.backward()
                 optimizer.step()
@@ -181,18 +182,18 @@ def _run_som_initialization_phase(model, train_gen, val_gen, optimizer, writers,
                     batch_val, _, _ = next(val_gen)
                     x_val = _np_to_torch(batch_val, device)
                     with torch.no_grad():
-                        loss_elbo = model.loss_reconstruction_ze(x_batch)
+                        loss_elbo, trc, tkl = model.loss_reconstruction_ze(x_batch, mu, logvar)
                         loss_init, loss_som_s, loss_commit_s = model.loss_a(z)
                         train_elbo = loss_elbo.item()
-                        train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
-                        train_log_lik = train_elbo - model.prior * train_kl
+                        train_kl = tkl.item()
+                        train_log_lik = trc.item()
 
-                        z_val = model(x_val)
-                        val_loss_elbo = model.loss_reconstruction_ze(x_val)
+                        z_val, mu_val, logvar_val = model(x_val)
+                        val_loss_elbo, rc, kl = model.loss_reconstruction_ze(x_val, mu_val, logvar_val)
                         test_elbo = val_loss_elbo.item()
                         val_loss_init, val_loss_som_s, val_loss_commit_s = model.loss_a(z_val)
-                        test_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
-                        test_log_lik = test_elbo - model.prior * test_kl
+                        test_kl = kl.item()
+                        test_log_lik = rc.item()
 
                     test_writer.add_scalar("loss/loss_elbo", test_elbo, step)
                     train_writer.add_scalar("loss/loss_elbo", train_elbo, step)
@@ -200,8 +201,8 @@ def _run_som_initialization_phase(model, train_gen, val_gen, optimizer, writers,
                     test_writer.add_scalar("loss_som_s/loss_som_s", val_loss_som_s.item(), step)
                     train_writer.add_scalar("loss_commit_s/loss_commit_s", loss_commit_s.item(), step)
                     train_writer.add_scalar("loss_som_s/loss_som_s", loss_som_s.item(), step)
-                    test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", train_kl, step)
-                    test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss", train_log_lik,
+                    test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", test_kl, step)
+                    test_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss", test_log_lik,
                                            step)
                     train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_kl", train_kl, step)
                     train_writer.add_scalar("loss_reconstruction_ze/loss_reconstruction_log_lik_loss", train_log_lik,
@@ -249,8 +250,8 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
                 g["lr"] = new_lr
 
             optimizer.zero_grad()
-            z = model(x_batch)
-            loss_total, loss_elbo, loss_commit, loss_som = model.loss(x_batch, z)
+            z, mu, logvar = model(x_batch)
+            loss_total, loss_elbo, loss_commit, loss_som, rc, kl = model.loss(x_batch, z, mu, logvar)
             loss_total.backward()
             optimizer.step()
 
@@ -260,8 +261,8 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
             train_som = loss_som.item()
             _, train_som_s, train_commit_s = model.loss_a(z)
 
-            train_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
-            train_log_lik = train_elbo - model.prior * train_kl
+            train_kl = kl.item()
+            train_log_lik = rc.item()
             train_loss_commit = train_commit
             train_loss_som = train_som
 
@@ -271,16 +272,16 @@ def _run_main_training_phase(model, train_gen, val_gen, optimizer, scheduler, wr
                 p_val = torch.from_numpy(ppv[ii_v * batch_size: (ii_v + 1) * batch_size]).float().to(device)
                 model.set_p(p_val)
 
-                z = model(x_val)
-                val_loss, val_elbo, val_commit, val_som = model.loss(x_val, z)
+                z, mu_val, logvar_val = model(x_val)
+                val_loss, val_elbo, val_commit, val_som, rc, kl = model.loss(x_val, z, mu_val, logvar_val)
                 test_loss = val_loss.item()
                 test_elbo_val = val_elbo.item()
                 test_commit = val_commit.item()
                 test_som = val_som.item()
                 _, test_som_s, test_commit_s = model.loss_a(z)
 
-                test_kl = model._kl_divergence_diag(model.mu, model.logvar).item()
-                test_log_lik = test_elbo_val - model.prior * test_kl
+                test_kl = kl.item()
+                test_log_lik = rc.item()
 
                 elbo_loss = test_elbo_val
                 cah_loss = test_commit

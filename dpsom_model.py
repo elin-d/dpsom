@@ -117,8 +117,6 @@ class DPSOM(nn.Module):
         self._train_epoch = 0
 
         self._p_tensor = None  # target distribution p (set externally each batch)
-        self.mu = None
-        self.logvar = None
 
     def get_epoch(self):
         return self._train_epoch
@@ -217,10 +215,8 @@ class DPSOM(nn.Module):
         mu, logvar = self._encode(x)
         eps = torch.randn_like(mu)
         z = mu + eps * torch.exp(0.5 * logvar)
-        self.mu = mu
-        self.logvar = logvar
         self.logits = self._decode(z)
-        return z
+        return z, mu, logvar
 
     @torch.compile
     def z_dist_flat(self, z):
@@ -339,14 +335,12 @@ class DPSOM(nn.Module):
         )
         return kl.mean()
 
-    def loss_reconstruction_ze(self, x):
+    def loss_reconstruction_ze(self, x, mu, logvar):
         """
         Compute ELBO: negative log-likelihood + prior * KL
         Bernoulli likelihood with logits; inputs expected in [0,1].
         """
 
-        mu = self.mu
-        logvar = self.logvar
         logits = self.logits # [B,784]
         x_flat = x.view(x.shape[0], -1).clamp(0.0, 1.0)
 
@@ -355,7 +349,7 @@ class DPSOM(nn.Module):
 
         kl_loss = self._kl_divergence_diag(mu, logvar)
         loss_rec = log_lik_loss + self.prior * kl_loss
-        return loss_rec
+        return loss_rec, log_lik_loss, kl_loss
 
     def q(self, z):
         """
@@ -449,14 +443,14 @@ class DPSOM(nn.Module):
         qq = -torch.mean(q_n)
         return qq
 
-    def loss(self, x, z):
+    def loss(self, x, z, mu, logvar):
         """
         Aggregate total loss.
         """
-        a = self.theta * self.loss_reconstruction_ze(x)
+        a, rc, kl = self.theta * self.loss_reconstruction_ze(x, mu, logvar)
         b = self.gamma * self.loss_commit(z)
         c = self.beta * self.loss_som(z)
-        return a + b + c, a, b, c
+        return a + b + c, a, b, c, rc, kl
 
     def loss_commit_s(self, z_ng):
         """
