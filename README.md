@@ -55,15 +55,15 @@ The implementation includes utilities for:
 Comparison between this PyTorch implementation and the original TensorFlow version (run with `Validation=True`).
 
 | Dataset | Metric | Dense (Torch) | Dense (TF) | Conv (Torch) | Conv (TF) |
-| :--- | :--- |:--------------| :--- | :--- | :--- |
-| **MNIST** | **NMI** | **0.6946**    | 0.6919 | **0.7267** | 0.6988 |
-| | **Purity** | 0.9609        | **0.9626** | **0.9833** | 0.9676 |
-| **fMNIST** | **NMI** | **0.5673**    | 0.5667 | **0.5712** | 0.5667 |
-| | **Purity** | 0.7738        | **0.7809** | 0.7766 | **0.7809** |
+| :--- | :--- |:--------------| :--- |:-------------| :--- |
+| **MNIST** | **NMI** | 0.6899(46)    | 0.6919 | 0.7131(76)   | 0.6988 |
+| | **Purity** | 0.9535(68)    | 0.9626 | 0.9651(98)   | 0.9676 |
+| **fMNIST** | **NMI** | 0.5673        | 0.5667 | 0.5712       | 0.5667 |
+| | **Purity** | 0.7738        | 0.7809 | 0.7766       | 0.7809 |
 
 ## File Structure
 
-- `dpsom.py`: Main training script with Sacred experiment configuration
+- `dpsom.py`: Main training script
 - `dpsom_model.py`: DPSOM model architecture and forward pass
 - `decay_scheduler.py`: Exponential learning rate decay scheduler
 - `utils.py`: Helper functions including clustering metrics
